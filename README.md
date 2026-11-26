@@ -1,6 +1,11 @@
 # code-indxr
 
-100% local, cross-platform MCP server and CLI for semantic + keyword code search and deterministic repository orientation, powered by **Ollama**, **Tree-sitter**, **LanceDB**, and **FastMCP**.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/Fast-Kode/code-indxr/actions/workflows/ci.yml/badge.svg)](https://github.com/Fast-Kode/code-indxr/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-FFDD00?style=flat&logo=buy-me-a-coffee&logoColor=black)](https://www.buymeacoffee.com/YOUR_USERNAME)
+
+100% local, cross-platform MCP server and CLI for hybrid semantic + keyword code search and deterministic repository orientation, powered by **Ollama**, **Tree-sitter**, **LanceDB**, and **FastMCP**.
 
 Zero source code leaves your machine.
 
@@ -20,16 +25,35 @@ Zero source code leaves your machine.
 ollama pull nomic-embed-text
 ```
 
+3. **`uv`** (recommended) or **`pipx`** to install `code-indxr` globally in an isolated environment:
+
+<details>
+<summary>How to install <code>uv</code> if you don't have it</summary>
+
+- **macOS / Linux:**
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  # Or via Homebrew: brew install uv
+  ```
+- **Windows (PowerShell):**
+  ```powershell
+  powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+  # Or via winget: winget install --id=astral-sh.uv -e
+  ```
+Restart your terminal after installing so `uv` is on your `PATH`.
+
+</details>
+
 ## Quickstart
 
-Install globally with `uv` or `pipx` (or `pip install`):
+Install globally with `uv` or `pipx`:
 
 ```bash
 # Using uv
-uv tool install git+https://github.com/samarthakv/code-indxr.git
+uv tool install git+https://github.com/Fast-Kode/code-indxr.git
 
 # Or using pipx
-pipx install git+https://github.com/samarthakv/code-indxr.git
+pipx install git+https://github.com/Fast-Kode/code-indxr.git
 ```
 
 Verify Ollama, model availability, and local storage:
@@ -139,18 +163,10 @@ Add to `.vscode/mcp.json` (note VS Code uses `"servers"` and `"type": "stdio"`):
 | `CODE_INDXR_CHUNK_OVERLAP_LINES` | `6` | Overlap lines for fallback window chunking |
 | `CODE_INDXR_LOG_LEVEL` | `WARNING` | `stderr` log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
-## Development
+## Contributing & Support
 
-```bash
-git clone https://github.com/samarthakv/code-indxr.git
-cd code-indxr
-python -m venv .venv
-# Windows: .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-# macOS/Linux: ./.venv/bin/python -m pip install -e ".[dev]"
-pytest -v
-ruff check .
-```
+- See [CONTRIBUTING.md](CONTRIBUTING.md) for local dev setup, testing, and PR guidelines.
+- See [SECURITY.md](SECURITY.md) for reporting vulnerabilities and [CHANGELOG.md](CHANGELOG.md) for release history.
+- Licensed under the [MIT License](LICENSE).
 
-## License
-
-[MIT](LICENSE)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://www.buymeacoffee.com/YOUR_USERNAME)

@@ -33,4 +33,4 @@ jobs:
           ruff format --check .
 
       - name: Run test suite
-        run: pytest -v
+        run: python -m pytest -v

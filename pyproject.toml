@@ -41,9 +41,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/samarthakv/code-indxr"
-Repository = "https://github.com/samarthakv/code-indxr"
-Issues = "https://github.com/samarthakv/code-indxr/issues"
+Homepage = "https://github.com/Fast-Kode/code-indxr"
+Repository = "https://github.com/Fast-Kode/code-indxr"
+Issues = "https://github.com/Fast-Kode/code-indxr/issues"
 
 [project.scripts]
 code-indxr = "code_indxr.cli:main"
@@ -52,6 +52,7 @@ code-indxr = "code_indxr.cli:main"
 packages = ["src/code_indxr"]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
