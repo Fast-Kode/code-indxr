@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "code-indxr": {
+      "type": "stdio",
+      "command": "code-indxr",
+      "args": ["serve"],
+      "env": {
+        "CODE_INDXR_OLLAMA_URL": "http://127.0.0.1:11434",
+        "CODE_INDXR_EMBED_MODEL": "nomic-embed-text"
+      }
+    }
+  }
+}

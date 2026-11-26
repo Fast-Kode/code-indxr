@@ -1,4 +1,4 @@
-"""Direct script entry point for Antigravity MCP registration."""
+"""Legacy stdio MCP entry point for existing mcp_config.json registrations."""
 
 from code_indxr.server import main
 

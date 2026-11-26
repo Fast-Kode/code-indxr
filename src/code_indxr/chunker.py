@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import logging
+import threading
 from dataclasses import dataclass
 from typing import Any
 
-from tree_sitter_language_pack import get_parser
+from tree_sitter import Parser
+from tree_sitter_language_pack import get_language
 
-from code_indxr.models import CodeChunk
+from code_indxr.models import CodeChunk, FileArtifacts, SymbolInfo
+
+logger = logging.getLogger("code_indxr.chunker")
 
 LANGUAGE_TO_TS_GRAMMAR: dict[str, str] = {
     "python": "python",
@@ -104,6 +109,20 @@ DECLARATION_NODE_TYPES: dict[str, frozenset[str]] = {
     "swift": frozenset({"class_declaration", "protocol_declaration", "function_declaration"}),
 }
 
+IMPORT_NODE_TYPES: frozenset[str] = frozenset(
+    {
+        "import_statement",
+        "import_from_statement",
+        "import_declaration",
+        "import_header",
+        "import_or_export",
+        "library_import",
+        "use_declaration",
+        "using_directive",
+        "preproc_include",
+    }
+)
+
 MEMBER_NODE_TYPES: frozenset[str] = frozenset(
     {
         "function_definition",
@@ -137,6 +156,8 @@ IDENTIFIER_TYPES: frozenset[str] = frozenset(
     }
 )
 
+_THREAD_LOCAL = threading.local()
+
 
 @dataclass(frozen=True)
 class _Span:
@@ -149,21 +170,40 @@ class _Span:
 
 
 @functools.lru_cache(maxsize=32)
-def _get_cached_parser(grammar: str) -> Any | None:
+def _get_cached_language(grammar: str) -> Any | None:
     try:
-        return get_parser(grammar)  # type: ignore[arg-type]
-    except Exception:
+        return get_language(grammar)  # type: ignore[arg-type]
+    except Exception as exc:
+        logger.warning("Failed to load tree-sitter language '%s': %s", grammar, exc)
         return None
 
 
+def _get_thread_parser(grammar: str) -> Parser | None:
+    """Return a thread-local tree-sitter Parser so worker threads never share C state."""
+    parsers: dict[str, Parser] | None = getattr(_THREAD_LOCAL, "parsers", None)
+    if parsers is None:
+        parsers = {}
+        _THREAD_LOCAL.parsers = parsers
+
+    parser = parsers.get(grammar)
+    if parser is not None:
+        return parser
+
+    lang = _get_cached_language(grammar)
+    if lang is None:
+        return None
+    parser = Parser(lang)
+    parsers[grammar] = parser
+    return parser
+
+
 def _make_chunk_id(repo_id: str, rel_path: str, start_line: int, end_line: int, idx: int) -> str:
-    raw = f"{repo_id}:{rel_path}:{start_line}:{end_line}:{idx}".encode("utf-8")
+    raw = f"{repo_id}:{rel_path}:{start_line}:{end_line}:{idx}".encode()
     return hashlib.blake2b(raw, digest_size=12).hexdigest()
 
 
 def _extract_symbol_name(node: Any, source_bytes: bytes) -> str:
     """Best-effort symbol name extraction across tree-sitter language grammars."""
-    # Unwrap export_statement or decorated_definition to inner declaration
     if node.type in {"export_statement", "decorated_definition"}:
         for child in node.named_children:
             if child.type not in {"decorator", "comment"}:
@@ -171,7 +211,6 @@ def _extract_symbol_name(node: Any, source_bytes: bytes) -> str:
                 if inner != "anonymous":
                     return inner
 
-    # Variable / lexical declarations (e.g., `export const UserCard = () => ...`)
     if node.type in {"lexical_declaration", "variable_declaration"}:
         for child in node.named_children:
             if child.type == "variable_declarator":
@@ -185,16 +224,20 @@ def _extract_symbol_name(node: Any, source_bytes: bytes) -> str:
         if text:
             return text
 
-    # Direct identifier children (Kotlin simple_identifier, Dart identifier, etc.)
     for child in node.named_children:
         if child.type in IDENTIFIER_TYPES:
             text = source_bytes[child.start_byte : child.end_byte].decode("utf-8", errors="ignore").strip()
             if text:
                 return text
 
-    # Nested signature (e.g., Dart declaration -> function_signature -> identifier)
     for child in node.named_children:
-        if child.type in {"function_signature", "method_signature", "getter_signature", "setter_signature", "variable_declaration"}:
+        if child.type in {
+            "function_signature",
+            "method_signature",
+            "getter_signature",
+            "setter_signature",
+            "variable_declaration",
+        }:
             nested = _extract_symbol_name(child, source_bytes)
             if nested != "anonymous":
                 return nested
@@ -214,6 +257,49 @@ def _find_body_node(node: Any) -> Any | None:
             if nested is not None:
                 return nested
     return None
+
+
+def _extract_signature(node: Any, source_bytes: bytes, end_node: Any | None = None) -> str:
+    """Collapse the declaration header (up to its body) into a single <=200-char line."""
+    body = None if end_node is not None and end_node is not node else _find_body_node(node)
+    end_byte = body.start_byte if body is not None and body.start_byte > node.start_byte else node.end_byte
+    raw = source_bytes[node.start_byte : end_byte].decode("utf-8", errors="ignore")
+    if body is None:
+        raw = raw.splitlines()[0] if raw else ""
+    collapsed = " ".join(part.strip() for part in raw.splitlines() if part.strip())
+    if len(collapsed) > 200:
+        return f"{collapsed[:197]}..."
+    return collapsed
+
+
+def _extract_docstring_excerpt(node: Any, source_bytes: bytes, language: str) -> str:
+    """Extract a concise first-line docstring or leading doc-comment excerpt (<=160 chars)."""
+    if language == "python":
+        body = _find_body_node(node)
+        if body is not None and body.named_children:
+            first = body.named_children[0]
+            str_node = None
+            if first.type == "string":
+                str_node = first
+            elif (
+                first.type == "expression_statement"
+                and first.named_children
+                and first.named_children[0].type == "string"
+            ):
+                str_node = first.named_children[0]
+            if str_node is not None:
+                raw = source_bytes[str_node.start_byte : str_node.end_byte].decode("utf-8", errors="ignore").strip()
+                cleaned = raw.strip("\"' \t\r\n")
+                first_line = next((ln.strip() for ln in cleaned.splitlines() if ln.strip()), "")
+                return first_line[:160]
+
+    prev = node.prev_named_sibling
+    if prev is not None and "comment" in prev.type:
+        raw = source_bytes[prev.start_byte : prev.end_byte].decode("utf-8", errors="ignore")
+        lines = [ln.strip().lstrip("/*# ").rstrip("*/").strip() for ln in raw.splitlines()]
+        first_line = next((ln for ln in lines if ln), "")
+        return first_line[:160]
+    return ""
 
 
 def _split_lines_window(
@@ -265,19 +351,26 @@ def _split_lines_window(
     return windows
 
 
-def _collect_top_level_nodes(root_node: Any, language: str) -> list[tuple[Any, Any | None]]:
-    """Collect declaration nodes from the AST root, pairing Dart signatures with bodies."""
+def _collect_top_level_nodes(root_node: Any, language: str) -> tuple[list[tuple[Any, Any | None]], list[Any]]:
+    """Collect declaration nodes and import nodes from the AST root."""
     target_types = DECLARATION_NODE_TYPES.get(language, frozenset())
     collected: list[tuple[Any, Any | None]] = []
+    imports: list[Any] = []
 
     def walk(parent: Any) -> None:
         children = list(parent.named_children)
         i = 0
         while i < len(children):
             child = children[i]
-            # Dart top-level functions appear as adjacent (function_signature, function_body) siblings
+            if child.type in IMPORT_NODE_TYPES:
+                imports.append(child)
+                i += 1
+                continue
+
             if language == "dart" and child.type in {"function_signature", "method_signature"}:
-                body_sibling = children[i + 1] if (i + 1 < len(children) and children[i + 1].type == "function_body") else None
+                body_sibling = (
+                    children[i + 1] if (i + 1 < len(children) and children[i + 1].type == "function_body") else None
+                )
                 collected.append((child, body_sibling))
                 i += 2 if body_sibling is not None else 1
                 continue
@@ -289,7 +382,7 @@ def _collect_top_level_nodes(root_node: Any, language: str) -> list[tuple[Any, A
             i += 1
 
     walk(root_node)
-    return collected
+    return collected, imports
 
 
 def _extract_member_spans(
@@ -297,28 +390,38 @@ def _extract_member_spans(
     parent_name: str,
     source_bytes: bytes,
     language: str,
-) -> list[_Span]:
+) -> list[tuple[_Span, Any]]:
     body = _find_body_node(parent_node)
     if body is None:
         return []
 
-    spans: list[_Span] = []
+    spans: list[tuple[_Span, Any]] = []
     children = list(body.named_children)
     i = 0
     while i < len(children):
         child = children[i]
-        if language == "dart" and child.type in {"method_signature", "function_signature", "getter_signature", "setter_signature"}:
-            body_sibling = children[i + 1] if (i + 1 < len(children) and children[i + 1].type == "function_body") else None
+        if language == "dart" and child.type in {
+            "method_signature",
+            "function_signature",
+            "getter_signature",
+            "setter_signature",
+        }:
+            body_sibling = (
+                children[i + 1] if (i + 1 < len(children) and children[i + 1].type == "function_body") else None
+            )
             end_node = body_sibling or child
             member_name = _extract_symbol_name(child, source_bytes)
             spans.append(
-                _Span(
-                    start_byte=child.start_byte,
-                    end_byte=end_node.end_byte,
-                    start_line=child.start_point[0] + 1,
-                    end_line=end_node.end_point[0] + 1,
-                    symbol_name=f"{parent_name}.{member_name}",
-                    symbol_kind=child.type,
+                (
+                    _Span(
+                        start_byte=child.start_byte,
+                        end_byte=end_node.end_byte,
+                        start_line=child.start_point[0] + 1,
+                        end_line=end_node.end_point[0] + 1,
+                        symbol_name=f"{parent_name}.{member_name}",
+                        symbol_kind=child.type,
+                    ),
+                    child,
                 )
             )
             i += 2 if body_sibling is not None else 1
@@ -327,20 +430,23 @@ def _extract_member_spans(
         if child.type in MEMBER_NODE_TYPES:
             member_name = _extract_symbol_name(child, source_bytes)
             spans.append(
-                _Span(
-                    start_byte=child.start_byte,
-                    end_byte=child.end_byte,
-                    start_line=child.start_point[0] + 1,
-                    end_line=child.end_point[0] + 1,
-                    symbol_name=f"{parent_name}.{member_name}",
-                    symbol_kind=child.type,
+                (
+                    _Span(
+                        start_byte=child.start_byte,
+                        end_byte=child.end_byte,
+                        start_line=child.start_point[0] + 1,
+                        end_line=child.end_point[0] + 1,
+                        symbol_name=f"{parent_name}.{member_name}",
+                        symbol_kind=child.type,
+                    ),
+                    child,
                 )
             )
         i += 1
     return spans
 
 
-def chunk_file(
+def extract_file_artifacts(
     repo_id: str,
     rel_path: str,
     content: str,
@@ -348,25 +454,35 @@ def chunk_file(
     max_chunk_chars: int = 2400,
     overlap_lines: int = 6,
     min_chunk_chars: int = 40,
-) -> list[CodeChunk]:
-    """Split a source file into AST-aware semantic chunks with line-window fallback."""
+) -> FileArtifacts:
+    """Single-pass AST extraction returning semantic chunks, symbol outlines, and imports."""
     if not content or not content.strip():
-        return []
+        return FileArtifacts(chunks=[], symbols=[], imports=[], used_fallback=False)
 
     normalized = content.replace("\r\n", "\n").replace("\r", "\n")
     all_lines = normalized.split("\n")
     grammar = LANGUAGE_TO_TS_GRAMMAR.get(language)
-    parser = _get_cached_parser(grammar) if grammar else None
+    parser = _get_thread_parser(grammar) if grammar else None
 
     raw_items: list[tuple[int, int, str, str, str]] = []
+    symbols: list[SymbolInfo] = []
+    imports: list[str] = []
+    used_fallback = False
 
     if parser is not None:
         source_bytes = normalized.encode("utf-8")
         try:
             tree = parser.parse(source_bytes)
-            top_nodes = _collect_top_level_nodes(tree.root_node, language)
-        except Exception:
-            top_nodes = []
+            top_nodes, import_nodes = _collect_top_level_nodes(tree.root_node, language)
+        except Exception as exc:
+            logger.warning("Tree-sitter parse failed for %s (%s): %s", rel_path, language, exc)
+            top_nodes, import_nodes = [], []
+            used_fallback = True
+
+        for imp_node in import_nodes[:40]:
+            imp_text = source_bytes[imp_node.start_byte : imp_node.end_byte].decode("utf-8", errors="ignore").strip()
+            if imp_text:
+                imports.append(" ".join(imp_text.splitlines())[:160])
 
         covered_lines: set[int] = set()
         for primary, sibling in top_nodes:
@@ -375,25 +491,56 @@ def chunk_file(
             end_line = end_node.end_point[0] + 1
             symbol_name = _extract_symbol_name(primary, source_bytes)
             symbol_kind = primary.type
-            node_text = source_bytes[primary.start_byte : end_node.end_byte].decode("utf-8", errors="ignore").strip("\n")
+            node_text = (
+                source_bytes[primary.start_byte : end_node.end_byte].decode("utf-8", errors="ignore").strip("\n")
+            )
 
             if not node_text.strip():
                 continue
+
+            symbols.append(
+                SymbolInfo(
+                    rel_path=rel_path,
+                    symbol_name=symbol_name,
+                    symbol_kind=symbol_kind,
+                    signature=_extract_signature(primary, source_bytes, end_node=end_node),
+                    docstring_excerpt=_extract_docstring_excerpt(primary, source_bytes, language),
+                    start_line=start_line,
+                    end_line=end_line,
+                )
+            )
+
+            # Always record member symbols for outlines even if the container fits in one chunk
+            member_entries = _extract_member_spans(primary, symbol_name, source_bytes, language)
+            for span, member_node in member_entries:
+                symbols.append(
+                    SymbolInfo(
+                        rel_path=rel_path,
+                        symbol_name=span.symbol_name,
+                        symbol_kind=span.symbol_kind,
+                        signature=_extract_signature(member_node, source_bytes),
+                        docstring_excerpt=_extract_docstring_excerpt(member_node, source_bytes, language),
+                        start_line=span.start_line,
+                        end_line=span.end_line,
+                    )
+                )
 
             if len(node_text) <= max_chunk_chars:
                 raw_items.append((start_line, end_line, symbol_name, symbol_kind, node_text))
                 covered_lines.update(range(start_line, end_line + 1))
                 continue
 
-            # Oversized container -> descend into class/object members first
-            member_spans = _extract_member_spans(primary, symbol_name, source_bytes, language)
-            if member_spans:
-                for span in member_spans:
-                    span_text = source_bytes[span.start_byte : span.end_byte].decode("utf-8", errors="ignore").strip("\n")
+            if member_entries:
+                for span, _member_node in member_entries:
+                    span_text = (
+                        source_bytes[span.start_byte : span.end_byte].decode("utf-8", errors="ignore").strip("\n")
+                    )
                     if not span_text.strip():
                         continue
                     if len(span_text) <= max_chunk_chars:
-                        raw_items.append((span.start_line, span.end_line, span.symbol_name, span.symbol_kind, span_text))
+                        raw_items.append(
+                            (span.start_line, span.end_line, span.symbol_name, span.symbol_kind, span_text)
+                        )
                     else:
                         raw_items.extend(
                             _split_lines_window(
@@ -419,7 +566,6 @@ def chunk_file(
                 )
                 covered_lines.update(range(start_line, end_line + 1))
 
-        # Capture meaningful top-level code not covered by declarations (e.g. scripts/routes/config blocks)
         if raw_items:
             gap_start: int | None = None
             gap_lines: list[str] = []
@@ -458,6 +604,8 @@ def chunk_file(
                     )
 
     if not raw_items:
+        if grammar is not None and not used_fallback:
+            used_fallback = False
         raw_items = _split_lines_window(
             all_lines,
             1,
@@ -484,7 +632,28 @@ def chunk_file(
                 content=text,
             )
         )
-    return chunks
+    return FileArtifacts(chunks=chunks, symbols=symbols, imports=imports, used_fallback=used_fallback)
+
+
+def chunk_file(
+    repo_id: str,
+    rel_path: str,
+    content: str,
+    language: str,
+    max_chunk_chars: int = 2400,
+    overlap_lines: int = 6,
+    min_chunk_chars: int = 40,
+) -> list[CodeChunk]:
+    """Split a source file into AST-aware semantic chunks with line-window fallback."""
+    return extract_file_artifacts(
+        repo_id=repo_id,
+        rel_path=rel_path,
+        content=content,
+        language=language,
+        max_chunk_chars=max_chunk_chars,
+        overlap_lines=overlap_lines,
+        min_chunk_chars=min_chunk_chars,
+    ).chunks
 
 
 def _is_imports_only(block: str) -> bool:

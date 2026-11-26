@@ -71,3 +71,42 @@ async def test_indexer_full_and_incremental_lifecycle(
         assert indexer.list_projects() == []
     finally:
         await indexer.close()
+
+
+async def test_batch_resumable_partial_and_keyword_fallback(
+    sample_repo: Path,
+    tmp_settings: Settings,
+    fake_embedder: FakeEmbedder,
+) -> None:
+    store = IndexStore(tmp_settings.data_dir, embed_model=tmp_settings.embed_model)
+    indexer = CodeIndexer(tmp_settings, store, fake_embedder)
+    try:
+        # Force a partial stop after the first 2-file batch via tiny time_budget_seconds
+        stats_partial = await indexer.index_repo(
+            sample_repo,
+            batch_files=2,
+            time_budget_seconds=0.000001,
+        )
+        assert stats_partial.status == "partial"
+        assert stats_partial.files_indexed == 2
+        assert stats_partial.files_remaining == 3
+        assert stats_partial.resume_hint is not None
+
+        # Resume completes only the remaining 3 files
+        stats_resumed = await indexer.index_repo(sample_repo, batch_files=2)
+        assert stats_resumed.status == "complete"
+        assert stats_resumed.files_indexed == 3
+        assert stats_resumed.files_skipped == 2
+        assert stats_resumed.files_remaining == 0
+
+        # Offline Ollama -> hybrid search degrades cleanly to keyword BM25
+        fake_embedder.fail_on_call = True
+        results, effective_mode, degraded, _warnings = await indexer.search_code_detailed(
+            "TokenService",
+            mode="hybrid",
+        )
+        assert effective_mode == "keyword"
+        assert "ollama_unavailable_keyword_fallback" in degraded
+        assert any(r.rel_path == "backend/token_service.py" for r in results)
+    finally:
+        await indexer.close()

@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from code_indxr.config import Settings
+from code_indxr.embedder import EmbedderError
 
 
 class FakeEmbedder:
@@ -35,13 +36,13 @@ class FakeEmbedder:
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
         if self.fail_on_call:
-            raise RuntimeError("Simulated embedder failure")
+            raise EmbedderError("Simulated embedder failure")
         self.document_calls.append(list(texts))
         return [self._vectorize(t) for t in texts]
 
     async def embed_query(self, query: str) -> list[float]:
         if self.fail_on_call:
-            raise RuntimeError("Simulated embedder failure")
+            raise EmbedderError("Simulated embedder failure")
         self.query_calls.append(query)
         return self._vectorize(query)
 

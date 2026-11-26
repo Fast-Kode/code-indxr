@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger("code_indxr.embedder")
 
 
 class EmbedderError(RuntimeError):
@@ -50,8 +53,7 @@ class OllamaEmbedder:
                 response = await self._client.post("/api/embed", json=payload)
                 if response.status_code == 404:
                     raise EmbedderError(
-                        f"Ollama model '{self.model}' not found at {self.base_url}. "
-                        f"Run: ollama pull {self.model}"
+                        f"Ollama model '{self.model}' not found at {self.base_url}. Run: ollama pull {self.model}"
                     )
                 response.raise_for_status()
                 data = response.json()
@@ -63,10 +65,22 @@ class OllamaEmbedder:
                 return [[float(v) for v in vec] for vec in embeddings]
             except EmbedderError:
                 raise
-            except (httpx.HTTPError, ValueError) as exc:
+            except httpx.ConnectError as exc:
                 last_error = exc
+                logger.debug("Ollama connect error (attempt %d/%d): %s", attempt, self.max_retries, exc)
                 if attempt < self.max_retries:
                     await asyncio.sleep(0.25 * (2 ** (attempt - 1)))
+            except (httpx.HTTPError, ValueError) as exc:
+                last_error = exc
+                logger.warning("Ollama embed error (attempt %d/%d): %s", attempt, self.max_retries, exc)
+                if attempt < self.max_retries:
+                    await asyncio.sleep(0.25 * (2 ** (attempt - 1)))
+
+        if isinstance(last_error, httpx.ConnectError):
+            raise EmbedderError(
+                f"Cannot reach Ollama at {self.base_url}. Start Ollama with 'ollama serve' "
+                f"and verify CODE_INDXR_OLLAMA_URL / OLLAMA_HOST."
+            ) from last_error
 
         raise EmbedderError(
             f"Failed to contact Ollama at {self.base_url} for model '{self.model}': {last_error}"
@@ -115,7 +129,7 @@ class OllamaEmbedder:
                 "ollama_url": self.base_url,
                 "model": self.model,
                 "model_available": False,
-                "error": str(exc),
+                "error": f"Cannot reach Ollama at {self.base_url}: {exc}",
             }
 
     async def close(self) -> None:

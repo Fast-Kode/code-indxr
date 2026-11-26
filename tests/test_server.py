@@ -51,9 +51,7 @@ async def test_mcp_server_end_to_end_tools(
             health = _decode_tool_result(await client.call_tool("health_check", {}))
             assert health["ok"] is True
 
-            idx_res = _decode_tool_result(
-                await client.call_tool("index_project", {"path": str(sample_repo)})
-            )
+            idx_res = _decode_tool_result(await client.call_tool("index_project", {"path": str(sample_repo)}))
             assert idx_res["files_indexed"] == 5
             repo_id = idx_res["repo_id"]
 
@@ -61,9 +59,7 @@ async def test_mcp_server_end_to_end_tools(
             assert listed["count"] == 1
             assert listed["projects"][0]["repo_id"] == repo_id
 
-            status = _decode_tool_result(
-                await client.call_tool("get_project_status", {"repo": repo_id})
-            )
+            status = _decode_tool_result(await client.call_tool("get_project_status", {"repo": repo_id}))
             assert status["indexed"] is True
             assert status["stale_files"] == 0
 
@@ -82,9 +78,7 @@ async def test_mcp_server_end_to_end_tools(
             assert search_res["count"] >= 1
             assert search_res["results"][0]["file_path"] == "src/components/AuthCard.tsx"
 
-            removed = _decode_tool_result(
-                await client.call_tool("remove_project", {"repo": repo_id})
-            )
+            removed = _decode_tool_result(await client.call_tool("remove_project", {"repo": repo_id}))
             assert removed["removed"] is True
 
             listed_after = _decode_tool_result(await client.call_tool("list_indexed_projects", {}))

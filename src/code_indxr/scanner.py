@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from pathlib import Path
 
 import pathspec
 
-from code_indxr.models import ScannedFile
+from code_indxr.models import DetectedManifest, ScannedFile, ScanResult
+
+logger = logging.getLogger("code_indxr.scanner")
 
 EXTENSION_LANGUAGE_MAP: dict[str, str] = {
     ".ts": "typescript",
@@ -58,6 +61,32 @@ SPECIAL_FILENAMES: dict[str, str] = {
     "dockerfile": "dockerfile",
     "makefile": "makefile",
     "cmakelists.txt": "cmake",
+}
+
+MANIFEST_FILENAMES: dict[str, str] = {
+    "pyproject.toml": "python",
+    "setup.py": "python",
+    "requirements.txt": "python",
+    "package.json": "node",
+    "tsconfig.json": "typescript",
+    "cargo.toml": "rust",
+    "go.mod": "go",
+    "pubspec.yaml": "dart",
+    "build.gradle": "gradle",
+    "build.gradle.kts": "gradle",
+    "settings.gradle": "gradle",
+    "settings.gradle.kts": "gradle",
+    "pom.xml": "maven",
+    "gemfile": "ruby",
+    "podfile": "cocoapods",
+    "dockerfile": "docker",
+    "docker-compose.yml": "docker",
+    "docker-compose.yaml": "docker",
+}
+
+MANIFEST_SUFFIXES: dict[str, str] = {
+    ".csproj": "dotnet",
+    ".sln": "dotnet",
 }
 
 DEFAULT_IGNORED_DIRS: frozenset[str] = frozenset(
@@ -141,9 +170,24 @@ def detect_language(path: Path) -> str | None:
     return EXTENSION_LANGUAGE_MAP.get(path.suffix.lower())
 
 
+def detect_manifest_kind(path: Path) -> str | None:
+    """Return manifest ecosystem kind if the file is a build/project manifest."""
+    name_lower = path.name.lower()
+    if name_lower in MANIFEST_FILENAMES:
+        return MANIFEST_FILENAMES[name_lower]
+    return MANIFEST_SUFFIXES.get(path.suffix.lower())
+
+
 def is_binary_content(sample: bytes) -> bool:
     """Detect binary files by checking for NUL bytes in a leading sample."""
     return b"\x00" in sample
+
+
+def is_binary_file(path: Path) -> bool:
+    """Read the leading 4 KB of a file and check for binary NUL bytes."""
+    with path.open("rb") as handle:
+        sample = handle.read(4096)
+    return is_binary_content(sample)
 
 
 def compute_file_hash(path: Path) -> str:
@@ -161,7 +205,8 @@ def _load_gitignore(directory: Path) -> pathspec.PathSpec | None:
         return None
     try:
         lines = gitignore_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
+    except OSError as exc:
+        logger.warning("Failed to read .gitignore at %s: %s", gitignore_path, exc)
         return None
     return pathspec.PathSpec.from_lines("gitignore", lines)
 
@@ -185,8 +230,13 @@ def _is_ignored(
     return False
 
 
-def scan_repository(root_path: Path, max_file_bytes: int = 512 * 1024) -> list[ScannedFile]:
-    """Walk a repository respecting .gitignore and default ignore rules."""
+def scan_repository_with_manifests(
+    root_path: Path,
+    max_file_bytes: int = 512 * 1024,
+    *,
+    sniff_binary: bool = True,
+) -> ScanResult:
+    """Walk a repository respecting .gitignore and default ignore rules, detecting manifests."""
     resolved_root = root_path.resolve()
     if not resolved_root.is_dir():
         raise FileNotFoundError(f"Repository path does not exist or is not a directory: {resolved_root}")
@@ -195,7 +245,9 @@ def scan_repository(root_path: Path, max_file_bytes: int = 512 * 1024) -> list[S
     root_spec = _load_gitignore(resolved_root)
     specs_by_dir[resolved_root] = [("", root_spec)] if root_spec else []
 
-    results: list[ScannedFile] = []
+    files: list[ScannedFile] = []
+    manifests: list[DetectedManifest] = []
+    unreadable = 0
 
     for dirpath_str, dirnames, filenames in os.walk(resolved_root, topdown=True):
         current_dir = Path(dirpath_str)
@@ -220,32 +272,39 @@ def scan_repository(root_path: Path, max_file_bytes: int = 512 * 1024) -> list[S
 
         for filename in sorted(filenames):
             file_path = current_dir / filename
+            rel_posix = file_path.relative_to(resolved_root).as_posix()
+
+            manifest_kind = detect_manifest_kind(file_path)
+            if manifest_kind is not None and not _is_ignored(rel_posix, False, active_specs):
+                manifests.append(DetectedManifest(rel_path=rel_posix, kind=manifest_kind))
+
             language = detect_language(file_path)
             if language is None:
                 continue
 
-            rel_posix = file_path.relative_to(resolved_root).as_posix()
             if _is_ignored(rel_posix, False, active_specs):
                 continue
 
             try:
                 stat = file_path.stat()
-            except OSError:
+            except OSError as exc:
+                unreadable += 1
+                logger.warning("Failed to stat %s: %s", file_path, exc)
                 continue
 
             if stat.st_size == 0 or stat.st_size > max_file_bytes:
                 continue
 
-            try:
-                with file_path.open("rb") as handle:
-                    sample = handle.read(4096)
-            except OSError:
-                continue
+            if sniff_binary:
+                try:
+                    if is_binary_file(file_path):
+                        continue
+                except OSError as exc:
+                    unreadable += 1
+                    logger.warning("Failed to sniff %s: %s", file_path, exc)
+                    continue
 
-            if is_binary_content(sample):
-                continue
-
-            results.append(
+            files.append(
                 ScannedFile(
                     rel_path=rel_posix,
                     abs_path=file_path,
@@ -255,4 +314,9 @@ def scan_repository(root_path: Path, max_file_bytes: int = 512 * 1024) -> list[S
                 )
             )
 
-    return results
+    return ScanResult(files=files, manifests=manifests, unreadable_files=unreadable)
+
+
+def scan_repository(root_path: Path, max_file_bytes: int = 512 * 1024) -> list[ScannedFile]:
+    """Backward-compatible wrapper returning scanned source files."""
+    return scan_repository_with_manifests(root_path, max_file_bytes=max_file_bytes, sniff_binary=True).files
